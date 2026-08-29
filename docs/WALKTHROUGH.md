@@ -1,24 +1,20 @@
-# Walkthrough: two firmware releases, switched with `docker run`
+# Walkthrough: two firmware apps, switched with `docker run`
 
-Build two versions of an application, ship each as an ordinary container image,
-and switch the MCU between them from the Docker CLI. Every command and every
-piece of output below was run against a Raspberry Pi Pico; the transcripts are
-what the machine actually printed.
+Two self-contained application directories. Build each with `docker build .`,
+deploy each with `docker run`, and switch the MCU between them.
 
-**Time:** about fifteen minutes, most of it firmware builds.
+Every command and transcript below was run against a Raspberry Pi Pico. The
+output is what the machine printed.
 
 ## What you need
 
-* A Pico already provisioned with MCUboot — one physical act, see
-  `docs/PROVISIONING.md`. Check it with:
-
+* A Pico provisioned with MCUboot — one physical act, see `docs/PROVISIONING.md`:
   ```bash
   cargo run -p smp-client --example ping -- /dev/balena-mcu/*-mgmt
   ```
-
   You want `echo -> "balena"` and a `describe` line back.
 * The udev rules installed, so the board appears under `/dev/balena-mcu/`.
-* Docker (tested on 28.5.2) and a Zephyr workspace (`west`, SDK 1.0.1).
+* Docker (tested on 28.5.2).
 
 ---
 
@@ -27,46 +23,165 @@ what the machine actually printed.
 ```bash
 cargo build
 sudo ./scripts/register-docker.sh
-```
-
-That installs the binary to `/usr/local/bin/mcu-runtime` and adds it to
-`/etc/docker/daemon.json` under `runtimes`, merging rather than overwriting.
-Confirm:
-
-```bash
 docker info | grep -A1 Runtimes
 #  Runtimes: io.containerd.runc.v2 mcu-runtime runc
 ```
 
-> **Re-run this after rebuilding the runtime.** The script *copies* the binary,
-> it does not symlink it, so a stale `/usr/local/bin/mcu-runtime` keeps being
-> used and everything still appears to work. Compare them:
->
-> ```bash
-> md5sum /usr/local/bin/mcu-runtime target/debug/mcu-runtime
-> ```
+> **Re-run this after rebuilding the runtime.** The script *copies* the binary
+> rather than symlinking it, so a stale `/usr/local/bin/mcu-runtime` keeps being
+> used while everything still appears to work:
+> `md5sum /usr/local/bin/mcu-runtime target/debug/mcu-runtime`
 
-## 2. Build two application versions
+## 2. Build the firmware builder image, once
 
-They differ only in the `VERSION` file, which is enough: `APP_VERSION_STRING`
-appears in the application's own boot log, so the running version shows up in
-`docker logs` with no extra instrumentation.
+Zephyr, MCUboot and the `balena-mcu` module, fetched once so that application
+directories stay small and self-contained.
 
 ```bash
-for V in 1 2; do
-  printf 'VERSION_MAJOR = %s\nVERSION_MINOR = 0\nPATCHLEVEL = 0\nVERSION_TWEAK = 0\nEXTRAVERSION =\n' "$V" \
-    > firmware/app/VERSION
-  ./scripts/build-pico.sh mcuboot
-  python3 bootloader/mcuboot/scripts/imgtool.py sign \
-    --key bootloader/mcuboot/root-rsa-2048.pem \
-    --header-size 0x200 --align 4 \
-    --version "$V.0.0" --slot-size 0xd0000 \
-    build-pico-mcuboot/app/zephyr/zephyr.bin "/tmp/app-v$V.signed.bin"
-done
-git checkout firmware/app/VERSION      # put it back
+docker build -f firmware/builder/Dockerfile -t balena-mcu-builder:v4.4.2 firmware/
 ```
 
-> ### ⚠️ No `--pad-header`, and check the result
+It is large (tens of GB, mostly the Zephyr SDK) and slow the first time. Rebuild
+it only when the Zephyr pin in `firmware/west.yml` changes. In a real deployment
+this is a published image a customer pulls, not something they build.
+
+## 3. The two applications
+
+`firmware/examples/app1` and `firmware/examples/app2`. Each is a complete Zephyr
+application plus a Dockerfile:
+
+```
+app1/
+├── Dockerfile
+├── CMakeLists.txt
+├── prj.conf          ordinary app config; no platform boilerplate
+├── sysbuild.conf     MCUboot on, swap mode pinned, signing key
+├── VERSION           feeds APP_VERSION_STRING and `describe`
+└── src/main.c
+```
+
+They are genuinely different programs, so switching is visible as behaviour
+rather than a version string: **app1 counts**, **app2 cycles through phases**.
+
+Nothing in `src/main.c` is aware of the runtime. The SMP server, the two
+contract channels and the `describe` command all arrive with the `balena-mcu`
+snippet at build time. This is the whole developer-facing surface:
+
+```dockerfile
+FROM balena-mcu-builder:v4.4.2 AS builder
+ARG BOARD=rpi_pico/rp2040/mcuboot
+COPY . /ws/app
+RUN west build -b "${BOARD}" --sysbuild /ws/app -d /ws/build -- \
+      -DZEPHYR_EXTRA_MODULES=/ws/balena-mcu \
+      -Dapp_SNIPPET=balena-mcu
+
+FROM scratch
+COPY --from=builder /ws/build/app/zephyr/zephyr.signed.bin /app.signed.bin
+ENTRYPOINT ["app.signed.bin"]
+```
+
+Stage two is the entire delivery format: `FROM scratch`, one signed image, an
+entrypoint naming it. **That entrypoint is the only contract between your image
+and the runtime.**
+
+> Two details worth knowing if you write your own. `-Dapp_SNIPPET=` rather than
+> `-S`, because under sysbuild a top-level snippet applies to *every* image
+> including the bootloader. And the `COPY . /ws/app` destination is what names
+> the sysbuild image, which is why `app_SNIPPET` and `/ws/build/app/` match
+> regardless of what the host directory is called.
+
+## 4. Build them
+
+```bash
+cd firmware/examples/app1 && docker build -t mcu-app1:v1 .
+cd ../app2              && docker build -t mcu-app2:v1 .
+```
+
+```
+mcu-app1:v1  132kB
+mcu-app2:v1  132kB
+```
+
+One layer holding one file. **Note there is no `imgtool` step** — sysbuild signs
+the image itself, correctly. Signing by hand is where the `--pad-header` trap
+lives (see §7); this workflow avoids it entirely.
+
+## 5. Deploy app1
+
+```bash
+docker run --rm --runtime=mcu-runtime --network none \
+  --annotation io.balena.mcu.target=usb:3-4 mcu-app1:v1
+```
+
+Replace `3-4` with your board's USB port path (`ls /dev/balena-mcu/`, or `lsusb -t`).
+
+```
+mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
+mcu: uploading 71656/71656 bytes (100%)
+mcu: image staged and marked test, resetting
+mcu: image confirmed
+<inf> app1: app1 1.0.0 up on rpi_pico/rp2040/mcuboot -- counting
+<inf> app1: app1: count = 0
+<inf> app1: app1: count = 1
+<inf> app1: app1: count = 2
+```
+
+Note the ordering: **staged and marked test, reset, and only then confirmed.**
+Confirmation happens after the new firmware has come back and answered, so an
+image that cannot speak the contract can never confirm itself, and MCUboot
+reverts it on the next boot. See `docs/ARCHITECTURE.md`.
+
+Everything after the reset is the MCU's own output, arriving on the log channel
+and going straight to container stdio. The container stays up: it is the
+firmware's supervisor, and stopping it releases the board.
+
+> `--network none` because a firmware container needs no networking — the
+> runtime talks to the MCU over USB from *outside* the container. It also skips
+> Docker's bridge setup, which on some hosts collides with an existing route.
+
+## 6. Switch to app2, and back
+
+```bash
+docker run --rm --runtime=mcu-runtime --network none \
+  --annotation io.balena.mcu.target=usb:3-4 mcu-app2:v1
+```
+
+```
+mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
+mcu: image confirmed
+<inf> app2: app2 2.0.0 up on rpi_pico/rp2040/mcuboot -- cycling phases
+<inf> app2: app2: phase = idle
+<inf> app2: app2: phase = sensing
+<inf> app2: app2: phase = reporting
+```
+
+It reports what is **currently** on the board (`running 1.0.0`) before replacing
+it. Running `mcu-app1:v1` again switches back — verified in both directions:
+
+```
+mcu: device is rpi_pico/rp2040/mcuboot running 2.0.0 (contract 1.2.0, 2 channels)
+mcu: image confirmed
+<inf> app1: app1 1.0.0 up on rpi_pico/rp2040/mcuboot -- counting
+```
+
+Redeploying an image already on the board is free:
+
+```
+mcu: device already runs this digest, confirmed; nothing to do
+```
+
+No upload, no flash write, no reset — which is what makes it safe for a
+supervisor to reconcile continuously. **The flip side when testing:** rebuild
+without changing anything and the digest is unchanged, so a test can pass having
+done nothing. Bump `VERSION`, or opt out with
+`--annotation io.balena.mcu.skip-if-same-hash=false`.
+
+## 7. If you sign by hand instead
+
+You do not need to — §4 has no signing step. But if you build outside this
+workflow:
+
+> ### ⚠️ No `--pad-header` for a hardware image
 >
 > An app built for MCUboot sets `CONFIG_ROM_START_OFFSET=0x200` and **already
 > reserves** its header space. `--pad-header` prepends a second one, so the
@@ -74,116 +189,32 @@ git checkout firmware/app/VERSION      # put it back
 > `imgtool verify` still passes. MCUboot jumps to `image + 0x200`, lands on
 > padding, loads `SP = 0`, and the board locks up unrecoverably.
 >
-> One line catches it — the word at `hdr_size` must be a RAM address:
->
 > ```bash
 > python3 -c "
 > import struct,pathlib,sys
 > d=pathlib.Path(sys.argv[1]).read_bytes()
 > h=struct.unpack('<H',d[8:10])[0]; sp=struct.unpack('<I',d[h:h+4])[0]
 > print(f'hdr={h:#x} sp={sp:#010x}', 'OK' if sp>>24==0x20 else 'MALFORMED')
-> " /tmp/app-v1.signed.bin
+> " image.signed.bin
 > # hdr=0x200 sp=0x20003890 OK
 > ```
 >
 > `--pad-header` *is* correct for native_sim, where `ROM_START_OFFSET=0`. That
-> asymmetry is what makes this easy to get wrong: a command copied from a
-> working simulator gate quietly produces a broken hardware image.
-
-## 3. Wrap each as a container image
-
-`FROM scratch`, the signed image, and an entrypoint naming it. That entrypoint
-is the entire contract between your image and the runtime.
-
-```bash
-for V in 1 2; do
-  mkdir -p "/tmp/ctx-v$V" && cp "/tmp/app-v$V.signed.bin" "/tmp/ctx-v$V/app.signed.bin"
-  printf 'FROM scratch\nADD app.signed.bin /\nENTRYPOINT ["app.signed.bin"]\n' \
-    > "/tmp/ctx-v$V/Dockerfile"
-  docker build -t "mcu-app:v$V" "/tmp/ctx-v$V"
-done
-```
-
-Both come out around 131 kB — one layer holding one file.
-
-## 4. Deploy v1
-
-```bash
-docker run --rm --runtime=mcu-runtime --network none \
-  --annotation io.balena.mcu.target=usb:3-4 mcu-app:v1
-```
-
-Replace `3-4` with your board's USB port path (`ls /dev/balena-mcu/`, or
-`lsusb -t`).
-
-```
-mcu: device is rpi_pico/rp2040/mcuboot running 0.1.0 (contract 1.2.0, 2 channels)
-mcu: uploading 71664/71664 bytes (100%)
-mcu: image staged and marked test, resetting
-mcu: image confirmed
-*** Booting Zephyr OS build dccb09599635 ***
-<inf> balena_mcu_usbd: USB device up with all contract channels registered
-<inf> app: balena-mcu template app 1.0.0 starting on rpi_pico/rp2040/mcuboot
-<inf> app: alive, tick 0
-```
-
-Note the ordering: **staged and marked test, reset, and only then confirmed.**
-Confirmation happens after the new firmware has come back and answered, so an
-image that cannot speak the contract can never confirm itself and MCUboot
-reverts it on the next boot. See `docs/ARCHITECTURE.md`.
-
-Everything after the reset is the MCU's own output, arriving on the log channel
-and going straight to container stdio. The container stays running: it is the
-firmware's supervisor, and stopping it is how you release the board.
-
-> `--network none` because a firmware container needs no networking — the
-> runtime talks to the MCU over USB from *outside* the container. It also skips
-> Docker's bridge setup, which on some hosts collides with an existing route.
-
-## 5. Switch to v2
-
-```bash
-docker run --rm --runtime=mcu-runtime --network none \
-  --annotation io.balena.mcu.target=usb:3-4 mcu-app:v2
-```
-
-```
-mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
-mcu: uploading 71664/71664 bytes (100%)
-mcu: image staged and marked test, resetting
-mcu: image confirmed
-<inf> app: balena-mcu template app 2.0.0 starting on rpi_pico/rp2040/mcuboot
-```
-
-It reports what is **currently** on the board (`running 1.0.0`) before replacing
-it. Run `mcu-app:v1` again to switch back — verified in both directions.
-
-## 6. Redeploy the same image
-
-```
-mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
-mcu: device already runs this digest, confirmed; nothing to do
-```
-
-No upload, no flash write, no reset. Redeploying a release already on the board
-is free, which is what makes it safe for a supervisor to reconcile continuously.
-
-**The flip side, when testing:** rebuild without changing the version and the
-digest is unchanged, so the deploy is a no-op — a test can pass having done
-nothing at all. Vary `--version` per build, as this walkthrough does. Opt out
-with `--annotation io.balena.mcu.skip-if-same-hash=false`.
+> asymmetry is what makes it easy to get wrong: the command copied from a
+> working simulator gate produces a broken hardware image.
 
 ---
 
 ## What to take from it
 
-* **Firmware is a normal container image.** `docker pull`, `docker run`, image
-  tags, restart policies — no special tooling.
+* **A firmware app is an ordinary container project.** A directory with a
+  Dockerfile, built with `docker build .`, run with `docker run`.
+* **The application source knows nothing about the platform.** Manageability
+  comes from the snippet at build time, not from application code.
 * **The container is the firmware's supervisor.** It stays up, pipes MCU logs to
-  stdio, and heartbeats. Losing the board exits non-zero, so restart policies
-  fire.
-* **The container needs no privileges and no device mappings.** The runtime holds
-  the USB device from outside; nothing inside the container ever touches it.
+  stdio, and heartbeats; losing the board exits non-zero so restart policies fire.
+* **No privileges, no device mappings.** The runtime holds the USB device from
+  outside; nothing inside the container touches it.
 * **Rollback is structural.** Confirmation is reachable only through the
   contract, so a broken image cannot confirm itself.
 
@@ -191,11 +222,12 @@ with `--annotation io.balena.mcu.skip-if-same-hash=false`.
 
 | Symptom | Cause |
 |---|---|
+| `"/west.yml": not found` during build | building an app against the old repo-context Dockerfile; use the builder image as in §3 |
 | `Unable to acquire exclusive lock on serial port` | a leftover proxy holds the device — `pgrep -af mcu-runtime`, then `docker rm -f` the container |
 | `could not resolve target usb:N-M` | wrong port path, or udev rules not installed |
-| Deploy says `nothing to do` unexpectedly | same digest; vary `--version` |
-| Board stops answering after a deploy | check the signed image with the `hdr_size` snippet in §2 before suspecting anything else |
+| Deploy says `nothing to do` unexpectedly | same digest; bump `VERSION` |
 | `failed to set up container networking` | use `--network none` |
+| Board stops answering after a deploy | if you signed by hand, check the image with §7 before suspecting anything else |
 
 ---
 
