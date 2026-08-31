@@ -3,10 +3,10 @@
 #
 #   docker build -t my-app:v1 .
 #
-# The build environment (Zephyr, MCUboot, the balena-mcu module) comes from the
+# The build environment (Zephyr, MCUboot, the runtt module) comes from the
 # builder image, so this directory is self-contained and the build context is
 # just the application.
-ARG BUILDER=balena-mcu-builder:v4.4.2
+ARG BUILDER=runtt-builder:v4.4.2
 FROM ${BUILDER} AS builder
 ARG BOARD=rpi_pico/rp2040/mcuboot
 
@@ -14,8 +14,8 @@ COPY . /ws/app
 # -Dapp_SNIPPET rather than -S: under sysbuild a top-level snippet applies to
 # every image, including the bootloader.
 RUN west build -b "${BOARD}" --sysbuild /ws/app -d /ws/build -- \
-      -DZEPHYR_EXTRA_MODULES=/ws/balena-mcu \
-      -Dapp_SNIPPET=balena-mcu
+      -DZEPHYR_EXTRA_MODULES=/ws/runtt \
+      -Dapp_SNIPPET=runtt
 
 # sysbuild signs the image itself, correctly. Do not re-sign this by hand with
 # imgtool --pad-header: the app already reserves its header space via

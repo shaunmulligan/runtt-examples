@@ -3,7 +3,7 @@
  *
  * Deliberately ordinary. Nothing here is aware of the runtime: the SMP server,
  * the two contract channels and the describe command all arrive with the
- * balena-mcu snippet at build time.
+ * runtt snippet at build time.
  */
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>

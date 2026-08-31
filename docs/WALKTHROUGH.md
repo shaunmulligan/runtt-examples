@@ -10,10 +10,10 @@ output is what the machine printed.
 
 * A Pico provisioned with MCUboot — one physical act, see `docs/PROVISIONING.md`:
   ```bash
-  cargo run -p smp-client --example ping -- /dev/balena-mcu/*-mgmt
+  cargo run -p runtt-smp --example ping -- /dev/runtt/*-mgmt
   ```
-  You want `echo -> "balena"` and a `describe` line back.
-* The udev rules installed, so the board appears under `/dev/balena-mcu/`.
+  You want `echo -> "runtt"` and a `describe` line back.
+* The udev rules installed, so the board appears under `/dev/runtt/`.
 * Docker (tested on 28.5.2).
 
 ---
@@ -24,21 +24,21 @@ output is what the machine printed.
 cargo build
 sudo ./scripts/register-docker.sh
 docker info | grep -A1 Runtimes
-#  Runtimes: io.containerd.runc.v2 mcu-runtime runc
+#  Runtimes: io.containerd.runc.v2 runtt runc
 ```
 
 > **Re-run this after rebuilding the runtime.** The script *copies* the binary
-> rather than symlinking it, so a stale `/usr/local/bin/mcu-runtime` keeps being
+> rather than symlinking it, so a stale `/usr/local/bin/runtt` keeps being
 > used while everything still appears to work:
-> `md5sum /usr/local/bin/mcu-runtime target/debug/mcu-runtime`
+> `md5sum /usr/local/bin/runtt target/debug/runtt`
 
 ## 2. Build the firmware builder image, once
 
-Zephyr, MCUboot and the `balena-mcu` module, fetched once so that application
+Zephyr, MCUboot and the `runtt` module, fetched once so that application
 directories stay small and self-contained.
 
 ```bash
-docker build -f firmware/builder/Dockerfile -t balena-mcu-builder:v4.4.2 firmware/
+docker build -f firmware/builder/Dockerfile -t runtt-builder:v4.4.2 firmware/
 ```
 
 It is large (tens of GB, mostly the Zephyr SDK) and slow the first time. Rebuild
@@ -64,16 +64,16 @@ They are genuinely different programs, so switching is visible as behaviour
 rather than a version string: **app1 counts**, **app2 cycles through phases**.
 
 Nothing in `src/main.c` is aware of the runtime. The SMP server, the two
-contract channels and the `describe` command all arrive with the `balena-mcu`
+contract channels and the `describe` command all arrive with the `runtt`
 snippet at build time. This is the whole developer-facing surface:
 
 ```dockerfile
-FROM balena-mcu-builder:v4.4.2 AS builder
+FROM runtt-builder:v4.4.2 AS builder
 ARG BOARD=rpi_pico/rp2040/mcuboot
 COPY . /ws/app
 RUN west build -b "${BOARD}" --sysbuild /ws/app -d /ws/build -- \
-      -DZEPHYR_EXTRA_MODULES=/ws/balena-mcu \
-      -Dapp_SNIPPET=balena-mcu
+      -DZEPHYR_EXTRA_MODULES=/ws/runtt \
+      -Dapp_SNIPPET=runtt
 
 FROM scratch
 COPY --from=builder /ws/build/app/zephyr/zephyr.signed.bin /app.signed.bin
@@ -109,11 +109,11 @@ lives (see §7); this workflow avoids it entirely.
 ## 5. Deploy app1
 
 ```bash
-docker run --rm --runtime=mcu-runtime --network none \
-  --annotation io.balena.mcu.target=usb:3-4 mcu-app1:v1
+docker run --rm --runtime=runtt --network none \
+  --annotation dev.runtt.target=usb:3-4 mcu-app1:v1
 ```
 
-Replace `3-4` with your board's USB port path (`ls /dev/balena-mcu/`, or `lsusb -t`).
+Replace `3-4` with your board's USB port path (`ls /dev/runtt/`, or `lsusb -t`).
 
 ```
 mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
@@ -142,8 +142,8 @@ firmware's supervisor, and stopping it releases the board.
 ## 6. Switch to app2, and back
 
 ```bash
-docker run --rm --runtime=mcu-runtime --network none \
-  --annotation io.balena.mcu.target=usb:3-4 mcu-app2:v1
+docker run --rm --runtime=runtt --network none \
+  --annotation dev.runtt.target=usb:3-4 mcu-app2:v1
 ```
 
 ```
@@ -174,7 +174,7 @@ No upload, no flash write, no reset — which is what makes it safe for a
 supervisor to reconcile continuously. **The flip side when testing:** rebuild
 without changing anything and the digest is unchanged, so a test can pass having
 done nothing. Bump `VERSION`, or opt out with
-`--annotation io.balena.mcu.skip-if-same-hash=false`.
+`--annotation dev.runtt.skip-if-same-hash=false`.
 
 ## 7. If you sign by hand instead
 
@@ -223,7 +223,7 @@ workflow:
 | Symptom | Cause |
 |---|---|
 | `"/west.yml": not found` during build | building an app against the old repo-context Dockerfile; use the builder image as in §3 |
-| `Unable to acquire exclusive lock on serial port` | a leftover proxy holds the device — `pgrep -af mcu-runtime`, then `docker rm -f` the container |
+| `Unable to acquire exclusive lock on serial port` | a leftover proxy holds the device — `pgrep -af runtt`, then `docker rm -f` the container |
 | `could not resolve target usb:N-M` | wrong port path, or udev rules not installed |
 | Deploy says `nothing to do` unexpectedly | same digest; bump `VERSION` |
 | `failed to set up container networking` | use `--network none` |
