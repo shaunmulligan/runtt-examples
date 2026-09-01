@@ -97,6 +97,38 @@ cd firmware/examples/app1 && docker build -t mcu-app1:v1 .
 cd ../app2              && docker build -t mcu-app2:v1 .
 ```
 
+### For a different board: one build arg
+
+The walkthrough uses a Pico because it needs no debug probe, but the application
+directories are not Pico-specific. `BOARD` is a build arg, so any supported target
+is one flag:
+
+```bash
+cd firmware/examples/app1
+
+# Adafruit Feather nRF52840
+docker build --build-arg BOARD=adafruit_feather_nrf52840/nrf52840 -t app1-feather:v1 .
+
+# Raspberry Pi Pico (the default)
+docker build --build-arg BOARD=rpi_pico/rp2040/mcuboot -t app1-pico:v1 .
+```
+
+Everything downstream is identical — the same `docker run`, the same annotation,
+the same deploy sequence. Only the placement label changes to name the board you
+mean. Verified on a Feather: the image above deployed, swapped and confirmed
+without a single other change.
+
+Two things that are easy to get wrong here:
+
+* **The board target must be one with MCUboot slots.** `adafruit_feather_nrf52840/nrf52840`
+  has them; `.../uf2` does **not** — it keeps Adafruit's bootloader and has no
+  slot1 at all, so there is nothing to stage into. For the Pico the equivalent
+  distinction is `rpi_pico/rp2040/mcuboot` rather than plain `rpi_pico`. See
+  [HARDWARE_TARGETS.md](HARDWARE_TARGETS.md).
+* **The board must already be provisioned** — MCUboot plus a signed image in
+  slot 0. That is the one physical act, and on the Feather it needs a debug probe.
+  See [PROVISIONING.md](PROVISIONING.md).
+
 ```
 mcu-app1:v1  132kB
 mcu-app2:v1  132kB
@@ -116,7 +148,7 @@ docker run --rm --runtime=runtt --network none \
 Replace `3-4` with your board's USB port path (`ls /dev/runtt/`, or `lsusb -t`).
 
 ```
-mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
+mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 2.0.0, 2 channels)
 mcu: uploading 71656/71656 bytes (100%)
 mcu: image staged and marked test, resetting
 mcu: image confirmed
@@ -147,7 +179,7 @@ docker run --rm --runtime=runtt --network none \
 ```
 
 ```
-mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 1.2.0, 2 channels)
+mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 2.0.0, 2 channels)
 mcu: image confirmed
 <inf> app2: app2 2.0.0 up on rpi_pico/rp2040/mcuboot -- cycling phases
 <inf> app2: app2: phase = idle
@@ -159,7 +191,7 @@ It reports what is **currently** on the board (`running 1.0.0`) before replacing
 it. Running `mcu-app1:v1` again switches back — verified in both directions:
 
 ```
-mcu: device is rpi_pico/rp2040/mcuboot running 2.0.0 (contract 1.2.0, 2 channels)
+mcu: device is rpi_pico/rp2040/mcuboot running 2.0.0 (contract 2.0.0, 2 channels)
 mcu: image confirmed
 <inf> app1: app1 1.0.0 up on rpi_pico/rp2040/mcuboot -- counting
 ```
@@ -223,6 +255,8 @@ workflow:
 | Symptom | Cause |
 |---|---|
 | `"/west.yml": not found` during build | building an app against the old repo-context Dockerfile; use the builder image as in §3 |
+| `runtt-builder:v4.4.2: not found` | the builder image is not built, or is tagged under an older name — rebuild it as in §2. It is cheap: the expensive layers cache, only the module layer rebuilds |
+| `/ws/runtt: no such file or directory` during an app build | the builder image predates a module path change. Rebuild it (§2); a stale builder carries the old layout |
 | `Unable to acquire exclusive lock on serial port` | a leftover proxy holds the device — `pgrep -af runtt`, then `docker rm -f` the container |
 | `could not resolve target usb:N-M` | wrong port path, or udev rules not installed |
 | Deploy says `nothing to do` unexpectedly | same digest; bump `VERSION` |
