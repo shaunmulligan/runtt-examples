@@ -13,8 +13,12 @@ ARG BOARD=rpi_pico/rp2040/mcuboot
 COPY . /ws/app
 # -Dapp_SNIPPET rather than -S: under sysbuild a top-level snippet applies to
 # every image, including the bootloader.
+# No -DZEPHYR_EXTRA_MODULES: the runtt module is a west project in the builder
+# image's workspace, so west has already registered it and `west build` finds its
+# Kconfig, CMakeLists and snippet on its own. The flag was needed only while the
+# module lived inside the same repository as the manifest, and it names a path
+# (/ws/runtt) that no longer exists.
 RUN west build -b "${BOARD}" --sysbuild /ws/app -d /ws/build -- \
-      -DZEPHYR_EXTRA_MODULES=/ws/runtt \
       -Dapp_SNIPPET=runtt
 
 # sysbuild signs the image itself, correctly. Do not re-sign this by hand with

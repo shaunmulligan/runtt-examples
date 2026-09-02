@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  ZEPHYR_SDK_VERSION: 1.0.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build both example applications for every supported board.
+  #
+  # NOT through their Dockerfiles, which is what these directories are really
+  # for, and that gap is deliberate rather than overlooked. The Dockerfiles start
+  # FROM runtt-builder, which builds FROM zephyrprojectrtos/ci -- an image
+  # carrying a toolchain for every architecture Zephyr supports, ~33 GB, more
+  # than a GitHub runner has free. runtt-boards' CI hit exactly that and dropped
+  # the container.
+  #
+  # So this builds the same sources the same way the Dockerfile does -- same
+  # board targets, same snippet flag -- from a west workspace. What it does not
+  # prove is that the Dockerfile itself works. Making runtt-boards' builder image
+  # slim enough to build here (a plain base plus `west sdk install -t
+  # arm-zephyr-eabi`, ~3 GB rather than 33) would close that, and is tracked in
+  # runtt's roadmap.
+  # ---------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RUNTT_BOARDS_REF: main
+    steps:
+      - name: Check out the examples
+        uses: actions/checkout@v4
+        with:
+          path: examples
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install west and build tools
+        run: |
+          pip install --quiet west pyelftools cryptography intelhex click cbor2 jsonschema
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build device-tree-compiler
+
+      - name: Cache the west workspace
+        uses: actions/cache@v4
+        with:
+          path: |
+            zephyr
+            modules
+            bootloader
+            boards
+            .west
+          key: west-${{ env.RUNTT_BOARDS_REF }}-${{ hashFiles('examples/.github/workflows/ci.yml') }}
+
+      - name: Assemble a workspace from runtt-boards
+        run: |
+          west init -m https://github.com/shaunmulligan/runtt-boards \
+                    --mr "${RUNTT_BOARDS_REF}" . 2>/dev/null || echo "already initialised"
+          west update --narrow -o=--depth=1
+          pip install --quiet -r zephyr/scripts/requirements-base.txt
+
+      - name: Cache the Zephyr SDK
+        id: sdk
+        uses: actions/cache@v4
+        with:
+          path: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-arm
+
+      - name: Install the ARM toolchain only
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          west sdk install --version "${ZEPHYR_SDK_VERSION}" \
+            --install-base "${GITHUB_WORKSPACE}" -t arm-zephyr-eabi
+
+      - name: Point Zephyr at it
+        run: echo "ZEPHYR_SDK_INSTALL_DIR=${GITHUB_WORKSPACE}/zephyr-sdk-${ZEPHYR_SDK_VERSION}" >> "$GITHUB_ENV"
+
+      # The board list comes from boards.yml, so adding a board there covers it
+      # here with no edit to this file. Fetched in its own step: a heredoc nested
+      # inside a YAML block scalar has to stay indented past the block, which is
+      # easy to get wrong and fails as a YAML parse error rather than a build one.
+      - name: Which boards are supported
+        run: |
+          python3 -c "
+          import json, urllib.request
+          u = 'https://raw.githubusercontent.com/shaunmulligan/runtt-boards/main/boards.json'
+          with urllib.request.urlopen(u, timeout=60) as r:
+              ids = [b['id'] for b in json.load(r)['boards'] if b['status'] == 'supported']
+          print('\n'.join(ids))
+          " | tee supported-boards.txt
+          test -s supported-boards.txt
+
+      # Every app against every supported board.
+      #
+      # The snippet flag is -D<image>_SNIPPET, and the image name comes from the
+      # SOURCE DIRECTORY -- app1_SNIPPET for app1, app2_SNIPPET for app2. Getting
+      # that wrong is silent: sysbuild ignores a flag naming an image that does
+      # not exist and exits zero, leaving firmware with no runtt module in it.
+      # That is exactly what happened in runtt-boards, and it is why the descriptor
+      # check below exists rather than trusting the build's exit status.
+      - name: Build every example for every supported board
+        run: |
+          set -euo pipefail
+          while read -r board; do
+            [ -n "$board" ] || continue
+            safe="${board//\//_}"
+            for app in examples/app1 examples/app2; do
+              name="$(basename "$app")"
+              echo "::group::$name on $board"
+              west build -p always -b "$board" --sysbuild "$app" \
+                -d "build-${name}-${safe}" -- "-D${name}_SNIPPET=runtt"
+              echo "::endgroup::"
+            done
+          done < supported-boards.txt
+
+      - name: The contract is in the built images
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          checked=0
+          for cfg in build-*/*/zephyr/.config; do
+            grep -q "^CONFIG_RUNTT_USB=y" "$cfg" || continue
+            elf="$(dirname "$cfg")/zephyr.elf"
+            for iface in runtt-mgmt runtt-log; do
+              strings "$elf" | grep -qx "$iface" \
+                || { echo "::error::$elf lacks the $iface descriptor"; exit 1; }
+            done
+            checked=$((checked + 1))
+          done
+          [ "$checked" -gt 0 ] || { echo "::error::no USB images built"; exit 1; }
+          echo "checked $checked image(s)"
+
+      - name: Upload the signed images
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-example-images
+          path: build-*/*/zephyr/zephyr.signed.bin
+          retention-days: 14
