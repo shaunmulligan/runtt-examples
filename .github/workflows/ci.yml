@@ -125,10 +125,19 @@ jobs:
           for cfg in build-*/*/zephyr/.config; do
             grep -q "^CONFIG_RUNTT_USB=y" "$cfg" || continue
             elf="$(dirname "$cfg")/zephyr.elf"
+          # strings(1) into a file, then grep the FILE. Not `strings ... | grep -q`:
+          # grep -q exits on the first match and closes the pipe, strings dies of
+          # SIGPIPE, and under `set -o pipefail` the pipeline reports failure
+          # BECAUSE the descriptor was found. That inverts this check -- it passes
+          # only when the contract is missing. Caught by running it with pipefail
+          # on, having written it and tested it without.
+            syms="$(mktemp)"
+            strings "$elf" > "$syms"
             for iface in runtt-mgmt runtt-log; do
-              strings "$elf" | grep -qx "$iface" \
+              grep -qx "$iface" "$syms" \
                 || { echo "::error::$elf lacks the $iface descriptor"; exit 1; }
             done
+            rm -f "$syms"
             checked=$((checked + 1))
           done
           [ "$checked" -gt 0 ] || { echo "::error::no USB images built"; exit 1; }
