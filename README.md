@@ -1,17 +1,28 @@
 # runtt-examples
 
-**Two firmware applications that deploy to a microcontroller with `docker run`.**
+**Two firmware applications that deploy to a microcontroller with one container
+run.**
 
-Each directory is a self-contained container project. `docker build .` produces
-an image whose entire contents are a signed firmware binary and an entrypoint
-naming it — which is all [runtt](https://github.com/shaunmulligan/runtt) reads.
+Each directory is a self-contained container project. A build produces an image
+whose entire contents are a signed firmware binary and an entrypoint naming it —
+which is all [runtt](https://github.com/shaunmulligan/runtt) reads.
 
 ```bash
 cd app1
-docker build -t app1:v1 .
-docker run --rm --network none --runtime=runtt \
-  --annotation dev.runtt.target=usb:3-4 app1:v1
+podman build -t app1:v1 .
+podman run --rm --network none --runtime=/usr/local/bin/runtt \
+  --annotation dev.runtt.target=usb:feather-01 app1:v1
 ```
+
+Podman throughout, because it takes `--runtime` as a **path** and needs no
+daemon configuration — nothing to install into `/etc/docker/daemon.json` and no
+restart. Docker works too, but the runtime has to be registered with the daemon
+first (`sudo scripts/register-docker.sh` in `runtt`), and only then does
+`--runtime=runtt` resolve by name.
+
+Pick one engine and stay on it within a session: podman and docker keep
+**separate image stores**, so `docker build -t app1:v1 .` followed by
+`podman run app1:v1` fails to find the image it just built.
 
 ## Start here
 
@@ -26,7 +37,7 @@ version of this against a mock device on a pty, with nothing physical involved.
 
 | | What it does | Why two |
 |---|---|---|
-| `app1` | counts, logging each tick | something recognisable in `docker logs` |
+| `app1` | counts, logging each tick | something recognisable in the container's logs |
 | `app2` | cycles through phases | visibly different from app1, so a switch is unmistakable |
 
 They exist to make a deploy *observable*. Watching the log output change from
@@ -37,8 +48,8 @@ counting to cycling is the proof that the new image is the one running.
 `BOARD` is a build argument, so nothing here is board-specific:
 
 ```bash
-docker build --build-arg BOARD=adafruit_feather_nrf52840/nrf52840 -t app1:v1 .
-docker build --build-arg BOARD=rpi_pico/rp2040/mcuboot          -t app1:v1 .
+podman build --build-arg BOARD=adafruit_feather_nrf52840/nrf52840 -t app1:v1 .
+podman build --build-arg BOARD=rpi_pico/rp2040/mcuboot          -t app1:v1 .
 ```
 
 Two things to get right: the target must be one that **has MCUboot slots**

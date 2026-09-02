@@ -1,7 +1,10 @@
-# Walkthrough: two firmware apps, switched with `docker run`
+# Walkthrough: two firmware apps, switched with one container run
 
-Two self-contained application directories. Build each with `docker build .`,
-deploy each with `docker run`, and switch the MCU between them.
+Two self-contained application directories. Build each as a container image,
+deploy each with one run command, and switch the MCU between them.
+
+Commands use `podman`, which takes `--runtime` as a path and so needs no daemon
+configuration. Docker works identically once the runtime is registered (§1).
 
 Every command and transcript below was run against a Raspberry Pi Pico. The
 output is what the machine printed.
@@ -18,19 +21,35 @@ output is what the machine printed.
 
 ---
 
-## 1. Register the runtime with Docker
+## 1. Point the engine at the runtime
+
+Podman takes `--runtime` as a **path**, so there is nothing to register and no
+daemon to restart — point it at the binary you just built:
 
 ```bash
-cargo build
+cd ../runtt          # the runtime repository
+cargo build --release
+RUNTT=$PWD/target/release/runtt
+```
+
+That also sidesteps a trap worth knowing about. The Docker path needs the
+runtime installed and registered:
+
+```bash
 sudo ./scripts/register-docker.sh
 docker info | grep -A1 Runtimes
 #  Runtimes: io.containerd.runc.v2 runtt runc
 ```
 
-> **Re-run this after rebuilding the runtime.** The script *copies* the binary
-> rather than symlinking it, so a stale `/usr/local/bin/runtt` keeps being
-> used while everything still appears to work:
-> `md5sum /usr/local/bin/runtt target/debug/runtt`
+> **Re-run that after every rebuild.** `register-docker.sh` *copies* the binary
+> rather than symlinking it, so a stale `/usr/local/bin/runtt` goes on being
+> used while everything still appears to work. Compare them before believing a
+> result: `md5sum /usr/local/bin/runtt target/release/runtt`. Naming the build
+> output directly, as the podman line above does, cannot go stale.
+
+> **Do not mix engines within a run.** Podman and Docker keep separate image
+> stores, so building with one and running with the other fails to find the
+> image — including the large builder image in §2.
 
 ## 2. Build the firmware builder image, once
 
@@ -38,16 +57,22 @@ Zephyr, MCUboot and the `runtt` module, fetched once so that application
 directories stay small and self-contained.
 
 ```bash
-docker build -f firmware/builder/Dockerfile -t runtt-builder:v4.4.2 firmware/
+cd ../runtt-boards    # the builder and the manifest live here
+podman build -f builder/Dockerfile -t runtt-builder:v4.4.2 .
 ```
 
-It is large (tens of GB, mostly the Zephyr SDK) and slow the first time. Rebuild
-it only when the Zephyr pin in `firmware/west.yml` changes. In a real deployment
+The build context is the repository root, not `builder/`, because the Dockerfile
+copies `west.yml` from it — that manifest is what pins Zephyr, MCUboot and the
+`runtt` module.
+
+It is large (~33 GB, almost all of it the Zephyr SDK's toolchains) and slow the
+first time. Rebuild it only when the Zephyr pin or the module revision in
+`west.yml` changes. In a real deployment
 this is a published image a customer pulls, not something they build.
 
 ## 3. The two applications
 
-`firmware/examples/app1` and `firmware/examples/app2`. Each is a complete Zephyr
+`app1/` and `app2/` in this repository. Each is a complete Zephyr
 application plus a Dockerfile:
 
 ```
@@ -72,7 +97,6 @@ FROM runtt-builder:v4.4.2 AS builder
 ARG BOARD=rpi_pico/rp2040/mcuboot
 COPY . /ws/app
 RUN west build -b "${BOARD}" --sysbuild /ws/app -d /ws/build -- \
-      -DZEPHYR_EXTRA_MODULES=/ws/runtt \
       -Dapp_SNIPPET=runtt
 
 FROM scratch
@@ -93,8 +117,8 @@ and the runtime.**
 ## 4. Build them
 
 ```bash
-cd firmware/examples/app1 && docker build -t mcu-app1:v1 .
-cd ../app2              && docker build -t mcu-app2:v1 .
+cd app1 && podman build -t mcu-app1:v1 .
+cd ../app2 && podman build -t mcu-app2:v1 .
 ```
 
 ### For a different board: one build arg
@@ -104,16 +128,16 @@ directories are not Pico-specific. `BOARD` is a build arg, so any supported targ
 is one flag:
 
 ```bash
-cd firmware/examples/app1
+cd app1
 
 # Adafruit Feather nRF52840
-docker build --build-arg BOARD=adafruit_feather_nrf52840/nrf52840 -t app1-feather:v1 .
+podman build --build-arg BOARD=adafruit_feather_nrf52840/nrf52840 -t app1-feather:v1 .
 
 # Raspberry Pi Pico (the default)
-docker build --build-arg BOARD=rpi_pico/rp2040/mcuboot -t app1-pico:v1 .
+podman build --build-arg BOARD=rpi_pico/rp2040/mcuboot -t app1-pico:v1 .
 ```
 
-Everything downstream is identical — the same `docker run`, the same annotation,
+Everything downstream is identical — the same run command, the same annotation,
 the same deploy sequence. Only the placement label changes to name the board you
 mean. Verified on a Feather: the image above deployed, swapped and confirmed
 without a single other change.
@@ -141,11 +165,14 @@ lives (see §7); this workflow avoids it entirely.
 ## 5. Deploy app1
 
 ```bash
-docker run --rm --runtime=runtt --network none \
-  --annotation dev.runtt.target=usb:3-4 mcu-app1:v1
+podman run --rm --runtime="$RUNTT" --network none \
+  --annotation dev.runtt.target=usb:feather-01 mcu-app1:v1
 ```
 
-Replace `3-4` with your board's USB port path (`ls /dev/runtt/`, or `lsusb -t`).
+The target names the board. A provisioned board answers to its serial, which is
+stable across ports and reboots — `ls /dev/runtt/by-serial/`. An unprovisioned
+one is addressed by USB port path instead (`usb:3-4`; `ls /dev/runtt/` or
+`lsusb -t`), which changes if you move the cable.
 
 ```
 mcu: device is rpi_pico/rp2040/mcuboot running 1.0.0 (contract 2.0.0, 2 channels)
@@ -169,13 +196,16 @@ firmware's supervisor, and stopping it releases the board.
 
 > `--network none` because a firmware container needs no networking — the
 > runtime talks to the MCU over USB from *outside* the container. It also skips
-> Docker's bridge setup, which on some hosts collides with an existing route.
+> bridge setup, which on some hosts collides with an existing route; that is a
+> real failure, seen on Docker as `cannot program address ... conflicts with
+> existing route`. CAN is the exception and needs `--network host`, because
+> SocketCAN interfaces live in the host's network namespace.
 
 ## 6. Switch to app2, and back
 
 ```bash
-docker run --rm --runtime=runtt --network none \
-  --annotation dev.runtt.target=usb:3-4 mcu-app2:v1
+podman run --rm --runtime="$RUNTT" --network none \
+  --annotation dev.runtt.target=usb:feather-01 mcu-app2:v1
 ```
 
 ```
@@ -240,7 +270,7 @@ workflow:
 ## What to take from it
 
 * **A firmware app is an ordinary container project.** A directory with a
-  Dockerfile, built with `docker build .`, run with `docker run`.
+  Dockerfile, built as an image, run with one run command.
 * **The application source knows nothing about the platform.** Manageability
   comes from the snippet at build time, not from application code.
 * **The container is the firmware's supervisor.** It stays up, pipes MCU logs to
