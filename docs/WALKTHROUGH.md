@@ -11,7 +11,7 @@ output is what the machine printed.
 
 ## What you need
 
-* A Pico provisioned with MCUboot — one physical act, see `docs/PROVISIONING.md`:
+* A Pico provisioned with MCUboot — one physical act, see [`PROVISIONING.md`](https://github.com/shaunmulligan/runtt-boards/blob/main/docs/PROVISIONING.md):
   ```bash
   cargo run -p runtt-smp --example ping -- /dev/runtt/*-mgmt
   ```
@@ -148,10 +148,10 @@ Two things that are easy to get wrong here:
   has them; `.../uf2` does **not** — it keeps Adafruit's bootloader and has no
   slot1 at all, so there is nothing to stage into. For the Pico the equivalent
   distinction is `rpi_pico/rp2040/mcuboot` rather than plain `rpi_pico`. See
-  [HARDWARE_TARGETS.md](HARDWARE_TARGETS.md).
+  [HARDWARE_TARGETS.md](https://github.com/shaunmulligan/runtt-boards/blob/main/docs/HARDWARE_TARGETS.md).
 * **The board must already be provisioned** — MCUboot plus a signed image in
   slot 0. That is the one physical act, and on the Feather it needs a debug probe.
-  See [PROVISIONING.md](PROVISIONING.md).
+  See [PROVISIONING.md](https://github.com/shaunmulligan/runtt-boards/blob/main/docs/PROVISIONING.md).
 
 ```
 mcu-app1:v1  132kB
@@ -188,7 +188,9 @@ mcu: image confirmed
 Note the ordering: **staged and marked test, reset, and only then confirmed.**
 Confirmation happens after the new firmware has come back and answered, so an
 image that cannot speak the contract can never confirm itself, and MCUboot
-reverts it on the next boot. See `docs/ARCHITECTURE.md`.
+reverts it at the next boot — a boot the device schedules for itself if the
+confirm does not arrive within 60 s (`CONFIG_RUNTT_CONFIRM_DEADLINE`), since
+nothing else would. See [`ARCHITECTURE.md`](https://github.com/shaunmulligan/runtt/blob/main/docs/ARCHITECTURE.md).
 
 Everything after the reset is the MCU's own output, arriving on the log channel
 and going straight to container stdio. The container stays up: it is the
