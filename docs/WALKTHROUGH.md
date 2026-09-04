@@ -148,7 +148,7 @@ Two things that are easy to get wrong here:
   has them; `.../uf2` does **not** — it keeps Adafruit's bootloader and has no
   slot1 at all, so there is nothing to stage into. For the Pico the equivalent
   distinction is `rpi_pico/rp2040/mcuboot` rather than plain `rpi_pico`. See
-  [HARDWARE_TARGETS.md](https://github.com/shaunmulligan/runtt-boards/blob/main/docs/HARDWARE_TARGETS.md).
+  [HARDWARE_TARGETS.md](https://github.com/shaunmulligan/runtt-boards/blob/main/NOTES.md).
 * **The board must already be provisioned** — MCUboot plus a signed image in
   slot 0. That is the one physical act, and on the Feather it needs a debug probe.
   See [PROVISIONING.md](https://github.com/shaunmulligan/runtt-boards/blob/main/docs/PROVISIONING.md).
