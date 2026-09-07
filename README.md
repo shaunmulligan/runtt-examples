@@ -52,6 +52,7 @@ podman build --build-arg BOARD=adafruit_feather_nrf52840/nrf52840 -t app1:v1 .
 podman build --build-arg BOARD=rpi_pico/rp2040/mcuboot           -t app1:v1 .
 podman build --build-arg BOARD=rpi_pico2/rp2350a/m33/w/mcuboot   -t app1:v1 .
 podman build --build-arg BOARD=adafruit_feather_canbus_rp2040/rp2040/mcuboot -t app1:v1 .
+podman build --build-arg BOARD=esp32s3_devkitc/esp32s3/procpu    -t app1:v1 .
 ```
 
 Two things to get right: the target must be one that **has MCUboot slots**
