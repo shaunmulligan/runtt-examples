@@ -6,6 +6,12 @@ on:
 
 env:
   ZEPHYR_SDK_VERSION: 1.0.1
+  # Every toolchain the board list needs. This job's matrix comes from
+  # runtt-boards' boards.yml, so a board promoted THERE lands here with no edit
+  # to this file -- which is the point, and also why this list has to be kept in
+  # step with that one. ARM covers RP2040, RP2350 and nRF52840; Xtensa covers
+  # the ESP32-S3.
+  ZEPHYR_SDK_TOOLCHAINS: arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -62,7 +68,29 @@ jobs:
                     --mr "${RUNTT_BOARDS_REF}" . 2>/dev/null || echo "already initialised"
           west update --narrow -o=--depth=1
           pip install --quiet -r zephyr/scripts/requirements-base.txt
+          # AND every MODULE's declared requirements, which is a different set.
+          # hal_espressif declares `esptool`, and Zephyr's Espressif SoC CMake
+          # wraps `find_program(esptool)` in a FATAL_ERROR -- so without it the
+          # ESP32-S3 fails at CONFIGURE ("Configuring incomplete"), which reads
+          # like a broken board port rather than a missing host package.
+          #
+          # Driven by `west packages` so the next module's requirement arrives
+          # on its own. Zephyr's aggregate requirements.txt is filtered out: it
+          # pulls the doc, compliance and test extras, and requirements-base
+          # above is the part a firmware build needs.
+          reqs=$(west packages pip | grep -v 'zephyr/scripts/requirements.txt' || true)
+          if [ -n "${reqs}" ]; then
+            echo "module requirements: ${reqs}"
+            # Word splitting is intended: a list of `-r <path>` pairs.
+            # shellcheck disable=SC2086
+            pip install --quiet ${reqs}
+          fi
 
+      # THE KEY UNDERSTATES WHAT THIS HOLDS, deliberately: it is ARM plus
+      # Xtensa. A key naming both would address nothing, so the install below
+      # would fetch the whole SDK cold instead of the one missing toolchain --
+      # which is how the same rename broke runtt-boards' ARM build. The step
+      # below verifies contents, so correctness does not rest on this string.
       - name: Cache the Zephyr SDK
         id: sdk
         uses: actions/cache@v4
@@ -70,11 +98,41 @@ jobs:
           path: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
           key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-arm
 
-      - name: Install the ARM toolchain only
-        if: steps.sdk.outputs.cache-hit != 'true'
+      # CHECK WHAT THE CACHE HOLDS, rather than trusting a hit. This step was
+      # `if: cache-hit != 'true'` and installed ARM alone. When the ESP32-S3 was
+      # promoted in runtt-boards, this job's matrix picked it up -- correctly --
+      # and then failed: the key was unchanged, so the restore hit an ARM-only
+      # cache, this step was skipped, and the board had no compiler. Verifying
+      # presence is self-healing where a corrected key fixes one instance.
+      - name: Install the toolchains the board list needs
         run: |
+          set -euo pipefail
+          sdk="zephyr-sdk-${ZEPHYR_SDK_VERSION}"
+          missing=""
+          for t in ${ZEPHYR_SDK_TOOLCHAINS}; do
+            # The compiler itself, not its directory: a directory can exist and
+            # be empty, and the compiler is what cmake goes looking for.
+            # Toolchains live under gnu/; tolerate a flat layout rather than
+            # depending on that detail.
+            if [ ! -x "${sdk}/gnu/${t}/bin/${t}-gcc" ] && [ ! -x "${sdk}/${t}/bin/${t}-gcc" ]; then
+              missing="${missing} ${t}"
+            fi
+          done
+          if [ -z "${missing}" ]; then
+            echo "  cache already has:${ZEPHYR_SDK_TOOLCHAINS// /, }"
+            exit 0
+          fi
+          echo "  missing from the cache:${missing}"
+          # ONE -t, then every toolchain. The option is argparse nargs="+" with
+          # the default store action, so a repeated -t REPLACES the earlier one:
+          # `-t arm-zephyr-eabi -t xtensa-...` installs Xtensa alone and exits
+          # 0. runtt-boards' CI shipped exactly that and stayed green only while
+          # its cache still held ARM; the first install from nothing built the
+          # Pico with no compiler.
+          # shellcheck disable=SC2086
           west sdk install --version "${ZEPHYR_SDK_VERSION}" \
-            --install-base "${GITHUB_WORKSPACE}" -t arm-zephyr-eabi
+            --install-base "${GITHUB_WORKSPACE}" -t ${ZEPHYR_SDK_TOOLCHAINS}
+          du -sh "${sdk}"
 
       - name: Point Zephyr at it
         run: echo "ZEPHYR_SDK_INSTALL_DIR=${GITHUB_WORKSPACE}/zephyr-sdk-${ZEPHYR_SDK_VERSION}" >> "$GITHUB_ENV"
@@ -149,3 +207,19 @@ jobs:
           name: ci-example-images
           path: build-*/*/zephyr/zephyr.signed.bin
           retention-days: 14
+
+      # WHEN A BUILD FAILS, SAY WHAT THE ENVIRONMENT WAS. Both faults this job
+      # has hit were environment facts -- a cache holding one toolchain, a
+      # runner without esptool -- that the build reported only obliquely.
+      # ::error:: lands it in the run's annotations, readable without logs.
+      # LAST in the job, deliberately: `if: failure()` is evaluated when the
+      # step is reached, so placed before the builds it was skipped for every
+      # build failure -- the very failures it was written for.
+      - name: What the environment looked like, on failure
+        if: failure()
+        run: |
+          sdk="zephyr-sdk-${ZEPHYR_SDK_VERSION}"
+          echo "::error title=SDK toolchains::$(ls "${sdk}/gnu" 2>/dev/null | tr '\n' ' ' || echo "NO ${sdk}/gnu")"
+          echo "::error title=host packages::$(pip list 2>/dev/null | grep -iE '^(esptool|imgtool|west|cbor|cryptography|intelhex) ' | tr '\n' ' ')"
+          echo "::error title=esptool on PATH::$(command -v esptool || echo ABSENT)"
+          echo "::error title=boards built for::$(tr '\n' ' ' < supported-boards.txt 2>/dev/null || echo unknown)"
