@@ -110,9 +110,11 @@ jobs:
           sdk="zephyr-sdk-${ZEPHYR_SDK_VERSION}"
           missing=""
           for t in ${ZEPHYR_SDK_TOOLCHAINS}; do
+            # The compiler itself, not its directory: a directory can exist and
+            # be empty, and the compiler is what cmake goes looking for.
             # Toolchains live under gnu/; tolerate a flat layout rather than
             # depending on that detail.
-            if [ ! -d "${sdk}/gnu/${t}" ] && [ ! -d "${sdk}/${t}" ]; then
+            if [ ! -x "${sdk}/gnu/${t}/bin/${t}-gcc" ] && [ ! -x "${sdk}/${t}/bin/${t}-gcc" ]; then
               missing="${missing} ${t}"
             fi
           done
@@ -121,11 +123,15 @@ jobs:
             exit 0
           fi
           echo "  missing from the cache:${missing}"
-          args=""
-          for t in ${ZEPHYR_SDK_TOOLCHAINS}; do args="${args} -t ${t}"; done
+          # ONE -t, then every toolchain. The option is argparse nargs="+" with
+          # the default store action, so a repeated -t REPLACES the earlier one:
+          # `-t arm-zephyr-eabi -t xtensa-...` installs Xtensa alone and exits
+          # 0. runtt-boards' CI shipped exactly that and stayed green only while
+          # its cache still held ARM; the first install from nothing built the
+          # Pico with no compiler.
           # shellcheck disable=SC2086
           west sdk install --version "${ZEPHYR_SDK_VERSION}" \
-            --install-base "${GITHUB_WORKSPACE}" ${args}
+            --install-base "${GITHUB_WORKSPACE}" -t ${ZEPHYR_SDK_TOOLCHAINS}
           du -sh "${sdk}"
 
       - name: Point Zephyr at it
@@ -154,19 +160,6 @@ jobs:
       # not exist and exits zero, leaving firmware with no runtt module in it.
       # That is exactly what happened in runtt-boards, and it is why the descriptor
       # check below exists rather than trusting the build's exit status.
-      # WHEN A BUILD FAILS, SAY WHAT THE ENVIRONMENT WAS. Both faults this job
-      # has hit were environment facts -- a cache holding one toolchain, a
-      # runner without esptool -- that the build reported only obliquely.
-      # ::error:: lands it in the run's annotations, readable without logs.
-      - name: What the environment looked like, on failure
-        if: failure()
-        run: |
-          sdk="zephyr-sdk-${ZEPHYR_SDK_VERSION}"
-          echo "::error title=SDK toolchains::$(ls "${sdk}/gnu" 2>/dev/null | tr '\n' ' ' || echo "NO ${sdk}/gnu")"
-          echo "::error title=host packages::$(pip list 2>/dev/null | grep -iE '^(esptool|imgtool|west|cbor|cryptography|intelhex) ' | tr '\n' ' ')"
-          echo "::error title=esptool on PATH::$(command -v esptool || echo ABSENT)"
-          echo "::error title=boards built for::$(tr '\n' ' ' < supported-boards.txt 2>/dev/null || echo unknown)"
-
       - name: Build every example for every supported board
         run: |
           set -euo pipefail
@@ -214,3 +207,19 @@ jobs:
           name: ci-example-images
           path: build-*/*/zephyr/zephyr.signed.bin
           retention-days: 14
+
+      # WHEN A BUILD FAILS, SAY WHAT THE ENVIRONMENT WAS. Both faults this job
+      # has hit were environment facts -- a cache holding one toolchain, a
+      # runner without esptool -- that the build reported only obliquely.
+      # ::error:: lands it in the run's annotations, readable without logs.
+      # LAST in the job, deliberately: `if: failure()` is evaluated when the
+      # step is reached, so placed before the builds it was skipped for every
+      # build failure -- the very failures it was written for.
+      - name: What the environment looked like, on failure
+        if: failure()
+        run: |
+          sdk="zephyr-sdk-${ZEPHYR_SDK_VERSION}"
+          echo "::error title=SDK toolchains::$(ls "${sdk}/gnu" 2>/dev/null | tr '\n' ' ' || echo "NO ${sdk}/gnu")"
+          echo "::error title=host packages::$(pip list 2>/dev/null | grep -iE '^(esptool|imgtool|west|cbor|cryptography|intelhex) ' | tr '\n' ' ')"
+          echo "::error title=esptool on PATH::$(command -v esptool || echo ABSENT)"
+          echo "::error title=boards built for::$(tr '\n' ' ' < supported-boards.txt 2>/dev/null || echo unknown)"
